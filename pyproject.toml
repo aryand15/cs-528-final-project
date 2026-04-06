@@ -1,0 +1,10 @@
+[project]
+name = "diy-controller"
+version = "0.1.0"
+description = "CS 528 Final Project: DIY Controller"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/aryand15/cs-528-final-project"
