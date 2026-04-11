@@ -142,7 +142,16 @@ class SerialReader(threading.Thread):
             )
 
 
-GESTURE_KEYS = {"u": "up", "d": "down", "l": "left", "r": "right"}
+GESTURE_KEYS = {
+    "f": "item_forwards", 
+    "b": "item_backwards", 
+    "h": "hold_item", 
+    "a": "accelerate",
+    "b": "brake",
+    "l": "steer_left",
+    "r": "steer_right",
+    "d": "drift_hop"
+}
 
 
 class GestureRecorder:
