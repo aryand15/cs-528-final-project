@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import sys
 import threading
@@ -29,6 +30,7 @@ import serial.tools.list_ports
 BAUD_RATE    = 115200
 WINDOW_SEC   = 5      # seconds of history to display
 SAMPLE_HZ    = 100    # expected sample rate (used only for buffer sizing)
+RECORD_SEC   = 4      # seconds to record each gesture
 
 # Regex that matches both raw ESP_LOGI lines and plain printed lines
 LINE_RE = re.compile(
@@ -79,11 +81,12 @@ def parse_line(line: str):
 class SerialReader(threading.Thread):
     """Background thread that fills shared deques from the serial port."""
 
-    def __init__(self, port: str, baud: int, buf_size: int):
+    def __init__(self, port: str, baud: int, buf_size: int, recorder=None):
         super().__init__(daemon=True)
         self.port     = port
         self.baud     = baud
         self.buf_size = buf_size
+        self.recorder = recorder
         self.lock     = threading.Lock()
 
         self.t    = deque(maxlen=buf_size)
@@ -121,6 +124,8 @@ class SerialReader(threading.Thread):
                             self.ax.append(ax);   self.ay.append(ay);   self.az.append(az)
                             self.gx.append(gx);   self.gy.append(gy);   self.gz.append(gz)
                             self.temp.append(temp)
+                        if self.recorder:
+                            self.recorder.add(ax, ay, az, gx, gy, gz)
             except serial.SerialException as e:
                 self.connected = False
                 self.status    = f"Disconnected — {e}  (retrying…)"
@@ -135,6 +140,69 @@ class SerialReader(threading.Thread):
                 list(self.gx), list(self.gy), list(self.gz),
                 list(self.temp),
             )
+
+
+GESTURE_KEYS = {"u": "up", "d": "down", "l": "left", "r": "right"}
+
+
+class GestureRecorder:
+    """Collects IMU samples during a gesture and saves them to a text file."""
+
+    def __init__(self, output_dir: str = "gestures"):
+        self.output_dir  = output_dir
+        self.lock        = threading.Lock()
+        self._recording  = False
+        self._label      = None
+        self._samples    = []   # list of (ax, ay, az, gx, gy, gz)
+        self._counts     = {}   # {label: next_index}
+        self._timer      = None
+        os.makedirs(output_dir, exist_ok=True)
+
+    @property
+    def recording(self):
+        return self._recording
+
+    @property
+    def label(self):
+        return self._label
+
+    def start(self, label: str):
+        if self._timer is not None:
+            self._timer.cancel()
+        with self.lock:
+            self._label     = label
+            self._samples   = []
+            self._recording = True
+        self._timer = threading.Timer(RECORD_SEC, self._finish)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def add(self, ax, ay, az, gx, gy, gz):
+        with self.lock:
+            if self._recording:
+                self._samples.append((ax, ay, az, gx, gy, gz))
+
+    def _finish(self):
+        """Called by the timer after the recording window — stops and saves."""
+        with self.lock:
+            if not self._recording:
+                return
+            self._recording = False
+            label   = self._label
+            samples = self._samples[:]
+
+        if not samples:
+            return
+
+        idx = self._counts.get(label, 0)
+        self._counts[label] = idx + 1
+        filename = os.path.join(self.output_dir, f"{label}_{idx:02d}.txt")
+
+        with open(filename, "w", encoding="utf-8") as f:
+            for sample in samples:
+                f.write(",".join(f"{value:.6f}" for value in sample) + "\n")
+
+        print(f"[SAVED] {len(samples)} samples → {filename}")
 
 
 def style_axes(ax, ylabel, ylim=None):
@@ -152,9 +220,10 @@ def style_axes(ax, ylabel, ylim=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Real-time MPU6050 plotter")
-    parser.add_argument("--port",   default=None,      help="Serial port (auto-detected if omitted)")
-    parser.add_argument("--baud",   default=BAUD_RATE,  type=int, help=f"Baud rate (default {BAUD_RATE})")
+    parser.add_argument("--port",   default=None,       help="Serial port (auto-detected if omitted)")
+    parser.add_argument("--baud",   default=BAUD_RATE,  type=int,   help=f"Baud rate (default {BAUD_RATE})")
     parser.add_argument("--window", default=WINDOW_SEC, type=float, help=f"Plot window in seconds (default {WINDOW_SEC})")
+    parser.add_argument("--output", default="gestures", help="Directory for saved gesture TXT files (default: gestures/)")
     args = parser.parse_args()
 
     port     = args.port or find_port()
@@ -163,7 +232,10 @@ def main():
     buf_size = int(window * SAMPLE_HZ * 2)   # 2× safety margin
 
     print(f"[INFO] Opening  {port}  at {baud} baud …")
-    reader = SerialReader(port, baud, buf_size)
+    print(f"[INFO] Gesture TXT files will be saved to: {os.path.abspath(args.output)}/")
+    print(f"[INFO] Keys: U=up  D=down  L=left  R=right  (records {RECORD_SEC} seconds automatically)")
+    recorder = GestureRecorder(output_dir=args.output)
+    reader   = SerialReader(port, baud, buf_size, recorder=recorder)
     reader.start()
 
     # ── Figure layout ─────────────────────────────────────────────────────────
@@ -207,6 +279,30 @@ def main():
                        labelcolor=C["text"])
 
     ax_temp.set_xlabel("Time (s)", fontsize=9)
+
+    # ── Recording status overlay ───────────────────────────────────────────────
+    rec_txt = fig.text(0.5, 0.955, "", ha="center", fontsize=11,
+                       fontweight="bold", color="#ff4444")
+
+    def update_rec_label():
+        if recorder.recording:
+            rec_txt.set_text(f"● REC  [{recorder.label.upper()}]  — {RECORD_SEC} s window")
+            rec_txt.set_color("#ff4444")
+        else:
+            rec_txt.set_text(f"Press U / D / L / R to record a {RECORD_SEC}-second gesture")
+            rec_txt.set_color("#888888")
+
+    update_rec_label()
+
+    def on_key(event):
+        key = (event.key or "").lower()
+        if key in GESTURE_KEYS:
+            recorder.start(GESTURE_KEYS[key])
+            print(f"[REC] Recording gesture: {GESTURE_KEYS[key]}")
+        update_rec_label()
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
 
     # Live numeric readouts
     def readout(ax, x, y, text=""):
@@ -274,6 +370,7 @@ def main():
             ro_t.set_text(f"{tmp[-1]:.2f} °C")
 
         status_txt.set_text(reader.status)
+        update_rec_label()
 
     from matplotlib.animation import FuncAnimation
     ani = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
