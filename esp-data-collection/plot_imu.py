@@ -30,7 +30,7 @@ import serial.tools.list_ports
 BAUD_RATE    = 115200
 WINDOW_SEC   = 5      # seconds of history to display
 SAMPLE_HZ    = 100    # expected sample rate (used only for buffer sizing)
-RECORD_SEC   = 4      # seconds to record each gesture
+RECORD_SEC   = 2      # seconds to record each gesture
 
 # Regex that matches both raw ESP_LOGI lines and plain printed lines
 LINE_RE = re.compile(
@@ -298,7 +298,7 @@ def main():
             rec_txt.set_text(f"● REC  [{recorder.label.upper()}]  — {RECORD_SEC} s window")
             rec_txt.set_color("#ff4444")
         else:
-            rec_txt.set_text(f"Press U / D / L / R to record a {RECORD_SEC}-second gesture")
+            rec_txt.set_text(f"Press f / b / h / a / b / l / r / d to record a {RECORD_SEC}-second gesture")
             rec_txt.set_color("#888888")
 
     update_rec_label()
