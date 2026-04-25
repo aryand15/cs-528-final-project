@@ -147,7 +147,7 @@ GESTURE_KEYS = {
     "b": "item_backwards", 
     "h": "hold_item", 
     "a": "accelerate",
-    "b": "brake",
+    "s": "brake",
     "l": "steer_left",
     "r": "steer_right",
     "d": "drift_hop"
