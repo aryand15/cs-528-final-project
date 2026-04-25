@@ -143,9 +143,10 @@ class SerialReader(threading.Thread):
 
 
 GESTURE_KEYS = {
-    "f": "item_forwards", 
-    "b": "item_backwards", 
-    "h": "hold_item", 
+    "f": "item_forwards",
+    "b": "item_backwards",
+    "h": "hold_item",
+    "x": "look_backwards",
     "a": "accelerate",
     "s": "brake",
     "l": "steer_left",
