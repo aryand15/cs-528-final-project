@@ -30,7 +30,7 @@ import serial.tools.list_ports
 BAUD_RATE    = 115200
 WINDOW_SEC   = 5      # seconds of history to display
 SAMPLE_HZ    = 100    # expected sample rate (used only for buffer sizing)
-RECORD_SEC   = 2      # seconds to record each gesture
+RECORD_SEC   = 1      # seconds to record each gesture
 
 # Regex that matches both raw ESP_LOGI lines and plain printed lines
 LINE_RE = re.compile(
