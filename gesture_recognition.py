@@ -38,6 +38,12 @@ ACTIVITY_THRESHOLD_FOOT = 0.05
 ACTIVITY_WINDOW         = 20
 COOLDOWN_SEC            = 1.0
 
+STEER_CALIB_SEC   = 2.0
+STEER_ALPHA       = 0.98
+STEER_PRINT_HZ    = 20.0
+STEER_BAR_WIDTH   = 41
+STEER_BAR_MAX_DEG = 90.0
+
 LINE_RE = re.compile(
   r"AX:(?P<ax>[-\d.]+)\s+AY:(?P<ay>[-\d.]+)\s+AZ:(?P<az>[-\d.]+)"
   r"\s*\|\s*"
@@ -115,6 +121,71 @@ def read_sample(ser):
   return parse_line(line)
 
 
+def wrap180(deg: float) -> float:
+  return ((deg + 180.0) % 360.0) - 180.0
+
+
+def steer_bar(angle_deg: float) -> str:
+  half = STEER_BAR_WIDTH // 2
+  pos = int(round((angle_deg / STEER_BAR_MAX_DEG) * half))
+  pos = max(-half, min(half, pos))
+  cells = ["-"] * STEER_BAR_WIDTH
+  cells[half] = "|"
+  cells[half + pos] = "#"
+  return "[" + "".join(cells) + "]"
+
+
+def steering_loop(port: str, baud: int):
+  print(f"[INFO] Opening {port} @ {baud} baud …")
+  with serial.Serial(port, baud, timeout=1) as ser:
+    print(f"[INFO] Hold the remote level for {STEER_CALIB_SEC:.1f}s to calibrate …")
+    calib = []
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < STEER_CALIB_SEC:
+      s = read_sample(ser)
+      if s is not None:
+        calib.append(s)
+    if len(calib) < 10:
+      print("[ERROR] Not enough calibration samples; is the IMU streaming?", file=sys.stderr)
+      return
+
+    arr = np.asarray(calib, dtype=np.float32)
+    ax0, ay0, _ = arr[:, 0:3].mean(axis=0)
+    gz_bias = float(arr[:, 5].mean())
+    zero_angle = float(np.degrees(np.arctan2(ax0, ay0)))
+    print(f"[CALIB] zero={zero_angle:+.2f}°  gz_bias={gz_bias:+.3f}°/s  "
+          f"({len(calib)} samples)")
+    print("[INFO] Steering active — rotate the remote around its z-axis (Ctrl-C to stop)")
+
+    angle = 0.0
+    last_t = time.perf_counter()
+    last_print = 0.0
+    print_period = 1.0 / STEER_PRINT_HZ
+
+    while True:
+      sample = read_sample(ser)
+      if sample is None:
+        continue
+      ax, ay, _, _, _, gz = sample
+      now = time.perf_counter()
+      dt = now - last_t
+      last_t = now
+      if dt <= 0 or dt > 0.5:
+        continue
+
+      accel_angle = wrap180(np.degrees(np.arctan2(ax, ay)) - zero_angle)
+      gyro_rate   = gz - gz_bias
+
+      predicted = angle + gyro_rate * dt
+      err       = wrap180(accel_angle - predicted)
+      angle     = wrap180(predicted + (1.0 - STEER_ALPHA) * err)
+
+      if now - last_print >= print_period:
+        last_print = now
+        print(f"\r[STEER] {angle:+7.2f}°  rate={gyro_rate:+7.2f}°/s  {steer_bar(angle)}",
+              end="", flush=True)
+
+
 def realtime_loop(model, port: str, baud: int, activity_threshold: float):
   print(f"[INFO] Opening {port} @ {baud} baud …")
   with serial.Serial(port, baud, timeout=1) as ser:
@@ -158,12 +229,22 @@ def main():
                       help=f"Directory of recorded gesture .txt files (default: {GESTURES_DIR}/)")
   args = parser.parse_args()
 
-  print("[INFO] Select gesture set:")
+  print("[INFO] Select mode:")
   print("  1) hold_item, item_forwards, item_backwards, look_backwards, drift_hop")
   print("  2) accelerate, brake")
+  print("  3) steering (continuous angle around z-axis)")
   choice = ""
-  while choice not in ("1", "2"):
-    choice = input("Press 1 or 2: ").strip()
+  while choice not in ("1", "2", "3"):
+    choice = input("Press 1, 2, or 3: ").strip()
+
+  if choice == "3":
+    port = find_port()
+    try:
+      steering_loop(port, args.baud)
+    except KeyboardInterrupt:
+      print("\n[INFO] Bye.")
+    return
+
   if choice == "1":
     labels = LABELS_1
     activity_threshold = ACTIVITY_THRESHOLD_HAND
