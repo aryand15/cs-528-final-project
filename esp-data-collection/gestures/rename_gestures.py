@@ -2,9 +2,9 @@ import os
 import re
 
 # Your three folders
-folders = ["cameron"]
+folders = ["oleg"]
 
-offset = 34
+offset = 68
 
 pattern = re.compile(r"^(.*?)_(\d+)\.txt$")
 
