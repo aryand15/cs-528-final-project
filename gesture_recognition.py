@@ -20,12 +20,17 @@ WINDOW_SEC    = 1.0
 WINDOW_LEN    = int(SAMPLE_HZ * WINDOW_SEC)
 GESTURES_DIR  = "gestures"
 
-LABELS = [
+LABELS_1 = [
   "hold_item",
   "item_forwards",
   "item_backwards",
   "look_backwards",
   "drift_hop",
+]
+
+LABELS_2 = [
+  "accelerate",
+  "brake",
 ]
 
 ACTIVITY_THRESHOLD = 0.15
@@ -152,8 +157,16 @@ def main():
                       help=f"Directory of recorded gesture .txt files (default: {GESTURES_DIR}/)")
   args = parser.parse_args()
 
+  print("[INFO] Select gesture set:")
+  print("  1) hold_item, item_forwards, item_backwards, look_backwards, drift_hop")
+  print("  2) accelerate, brake")
+  choice = ""
+  while choice not in ("1", "2"):
+    choice = input("Press 1 or 2: ").strip()
+  labels = LABELS_1 if choice == "1" else LABELS_2
+
   print("[INFO] Loading training data …")
-  X, y = load_dataset(args.gestures_dir, LABELS)
+  X, y = load_dataset(args.gestures_dir, labels)
   if len(X) == 0:
     print("[ERROR] No training samples loaded.", file=sys.stderr)
     sys.exit(1)
