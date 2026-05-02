@@ -33,9 +33,10 @@ LABELS_2 = [
   "brake",
 ]
 
-ACTIVITY_THRESHOLD = 0.15
-ACTIVITY_WINDOW    = 20
-COOLDOWN_SEC       = 1.0
+ACTIVITY_THRESHOLD_HAND = 0.15
+ACTIVITY_THRESHOLD_FOOT = 0.05
+ACTIVITY_WINDOW         = 20
+COOLDOWN_SEC            = 1.0
 
 LINE_RE = re.compile(
   r"AX:(?P<ax>[-\d.]+)\s+AY:(?P<ay>[-\d.]+)\s+AZ:(?P<az>[-\d.]+)"
@@ -114,7 +115,7 @@ def read_sample(ser):
   return parse_line(line)
 
 
-def realtime_loop(model, port: str, baud: int):
+def realtime_loop(model, port: str, baud: int, activity_threshold: float):
   print(f"[INFO] Opening {port} @ {baud} baud …")
   with serial.Serial(port, baud, timeout=1) as ser:
     print("[INFO] Listening for gestures (Ctrl-C to stop)")
@@ -131,7 +132,7 @@ def realtime_loop(model, port: str, baud: int):
 
       arr = np.asarray(recent, dtype=np.float32)
       activity = np.linalg.norm(arr[:, :3], axis=1).std()
-      if activity < ACTIVITY_THRESHOLD:
+      if activity < activity_threshold:
         continue
 
       window = list(recent)
@@ -163,7 +164,12 @@ def main():
   choice = ""
   while choice not in ("1", "2"):
     choice = input("Press 1 or 2: ").strip()
-  labels = LABELS_1 if choice == "1" else LABELS_2
+  if choice == "1":
+    labels = LABELS_1
+    activity_threshold = ACTIVITY_THRESHOLD_HAND
+  else:
+    labels = LABELS_2
+    activity_threshold = ACTIVITY_THRESHOLD_FOOT
 
   print("[INFO] Loading training data …")
   X, y = load_dataset(args.gestures_dir, labels)
@@ -177,7 +183,7 @@ def main():
 
   port = find_port()
   try:
-    realtime_loop(model, port, args.baud)
+    realtime_loop(model, port, args.baud, activity_threshold)
   except KeyboardInterrupt:
     print("\n[INFO] Bye.")
 
