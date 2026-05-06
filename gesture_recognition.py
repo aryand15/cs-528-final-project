@@ -36,6 +36,7 @@ LABELS_2 = [
 
 ACTIVITY_THRESHOLD_HAND = 0.15
 ACTIVITY_THRESHOLD_FOOT = 0.05
+DRIFT_HOP_ACTIVITY_THRESHOLD = 0.18
 ACTIVITY_WINDOW         = 20
 COOLDOWN_SEC            = 1.0
 
@@ -331,7 +332,7 @@ def steering_loop(port: str, baud: int, stop_event=None, name: str = "steering")
 
 
 def realtime_loop(model, port: str, baud: int, activity_threshold: float,
-                  stop_event=None, name: str = "gesture"):
+                  label_activity_thresholds=None, stop_event=None, name: str = "gesture"):
   log(f"[{name}] Opening {port} @ {baud} baud ...")
   with serial.Serial(port, baud, timeout=0.2) as ser:
     log(f"[{name}] Listening for gestures (Ctrl-C to stop)")
@@ -361,6 +362,10 @@ def realtime_loop(model, port: str, baud: int, activity_threshold: float,
 
       feats = features(window[:WINDOW_LEN]).reshape(1, -1)
       pred = model.predict(feats)[0]
+      label_threshold = (label_activity_thresholds or {}).get(pred)
+      if label_threshold is not None and activity < label_threshold:
+        recent.clear()
+        continue
       log(f"[{name}] GESTURE {pred}   (activity={activity:.3f})")
 
       t0 = time.perf_counter()
@@ -391,7 +396,8 @@ def run_all_controllers(assignments, right_hand_model, foot_model, baud: int):
     threading.Thread(
       target=controller_worker,
       args=("right hand", stop_event, realtime_loop,
-            right_hand_model, assignments[2], baud, ACTIVITY_THRESHOLD_HAND),
+            right_hand_model, assignments[2], baud, ACTIVITY_THRESHOLD_HAND,
+            {"drift_hop": DRIFT_HOP_ACTIVITY_THRESHOLD}),
       daemon=False,
     ),
     threading.Thread(
