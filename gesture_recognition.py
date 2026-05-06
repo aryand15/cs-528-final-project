@@ -4,6 +4,7 @@ import glob
 import os
 import re
 import sys
+import threading
 import time
 from collections import deque
 
@@ -38,6 +39,15 @@ ACTIVITY_THRESHOLD_FOOT = 0.05
 ACTIVITY_WINDOW         = 20
 COOLDOWN_SEC            = 1.0
 
+CONTROLLER_NAMES = {
+  1: "left hand",
+  2: "right hand",
+  3: "foot",
+}
+
+DETECT_SEC          = 2.0
+DETECT_MIN_ACTIVITY = 0.03
+
 STEER_CALIB_SEC   = 2.0
 STEER_ALPHA       = 0.98
 STEER_PRINT_HZ    = 20.0
@@ -50,23 +60,148 @@ LINE_RE = re.compile(
   r"GX:(?P<gx>[-\d.]+)\s+GY:(?P<gy>[-\d.]+)\s+GZ:(?P<gz>[-\d.]+)"
 )
 
+PRINT_LOCK = threading.Lock()
+
+
+def log(message: str = "", end: str = "\n"):
+  with PRINT_LOCK:
+    print(message, end=end, flush=True)
+
 
 def parse_line(line: str):
   m = LINE_RE.search(line)
   if m:
-    return tuple(float(m.group(k)) for k in ("ax", "ay", "az", "gx", "gy", "gz"))
+    try:
+      return tuple(float(m.group(k)) for k in ("ax", "ay", "az", "gx", "gy", "gz"))
+    except ValueError:
+      return None
   return None
 
 
-def find_port() -> str:
-  ports = serial.tools.list_ports.comports()
-  usb = [p for p in ports if "usb" in p.device.lower() or "usbserial" in p.device.lower()]
-  if usb:
-    return usb[0].device
-  if ports:
-    return ports[0].device
-  print("[ERROR] No serial ports found. Plug in your ESP32 or specify --port.", file=sys.stderr)
-  sys.exit(1)
+def read_sample(ser):
+  raw = ser.readline()
+  try:
+    line = raw.decode("utf-8", errors="replace").strip()
+  except Exception:
+    return None
+  return parse_line(line)
+
+
+def serial_port_candidates():
+  ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
+  usb = [
+    p for p in ports
+    if "usb" in f"{p.device} {p.description} {p.hwid}".lower()
+  ]
+  return usb or ports
+
+
+def describe_port(port_info) -> str:
+  description = getattr(port_info, "description", "") or "serial device"
+  return f"{port_info.device} ({description})"
+
+
+def open_setup_serials(baud: int):
+  serials = {}
+  for port_info in serial_port_candidates():
+    try:
+      ser = serial.Serial(port_info.device, baud, timeout=0.01)
+      ser.reset_input_buffer()
+      serials[port_info.device] = ser
+      log(f"[SETUP] Found {describe_port(port_info)}")
+    except serial.SerialException as e:
+      log(f"[WARN] Could not open {port_info.device}: {e}")
+  if len(serials) < 3:
+    log("[ERROR] Need at least 3 open serial ports for the three controllers.")
+    sys.exit(1)
+  return serials
+
+
+def score_port_activity(samples) -> float:
+  if len(samples) < 5:
+    return 0.0
+  arr = np.asarray(samples, dtype=np.float32)
+  accel_activity = float(np.linalg.norm(arr[:, :3], axis=1).std())
+  gyro_activity = float(np.linalg.norm(arr[:, 3:], axis=1).std())
+  return accel_activity + 0.01 * gyro_activity
+
+
+def detect_moving_port(serials, duration_sec: float):
+  for ser in serials.values():
+    ser.reset_input_buffer()
+
+  samples_by_port = {port: [] for port in serials}
+  end_at = time.perf_counter() + duration_sec
+  while time.perf_counter() < end_at:
+    got_sample = False
+    for port, ser in serials.items():
+      sample = read_sample(ser)
+      if sample is not None:
+        samples_by_port[port].append(sample)
+        got_sample = True
+    if not got_sample:
+      time.sleep(0.005)
+
+  scores = {
+    port: score_port_activity(samples)
+    for port, samples in samples_by_port.items()
+  }
+  if not scores:
+    return None, 0.0, scores
+  detected_port, activity = max(scores.items(), key=lambda item: item[1])
+  return detected_port, activity, scores
+
+
+def assign_controller_ports(baud: int):
+  log("[SETUP] Plug in all 3 USB controllers now.")
+  input("[SETUP] Press Enter when all three are connected: ")
+
+  serials = open_setup_serials(baud)
+  assigned = {}
+  remaining = dict(serials)
+  try:
+    while len(assigned) < 3:
+      log("")
+      log("[SETUP] Move exactly one unassigned controller.")
+      input(f"[SETUP] Press Enter, then keep it moving for {DETECT_SEC:.1f}s: ")
+      detected_port, activity, scores = detect_moving_port(remaining, DETECT_SEC)
+
+      log("[SETUP] Activity by port:")
+      for port, score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+        marker = "<-- detected" if port == detected_port else ""
+        log(f"  {port:16s} activity={score:.3f} {marker}")
+
+      if detected_port is None or activity < DETECT_MIN_ACTIVITY:
+        log("[WARN] I did not see enough motion. Try that controller again.")
+        continue
+
+      choice = ""
+      while choice not in ("1", "2", "3", "r"):
+        choice = input(
+          f"[SETUP] Detected {detected_port}. Assign it to "
+          "1=left hand, 2=right hand, 3=foot, or r=retry: "
+        ).strip().lower()
+
+      if choice == "r":
+        continue
+
+      controller_id = int(choice)
+      if controller_id in assigned:
+        log(f"[WARN] Controller {controller_id} is already assigned to {assigned[controller_id]}.")
+        continue
+
+      assigned[controller_id] = detected_port
+      remaining.pop(detected_port)
+      log(f"[SETUP] Controller {controller_id} ({CONTROLLER_NAMES[controller_id]}) -> {detected_port}")
+
+    log("")
+    log("[SETUP] Controller mapping complete:")
+    for controller_id in sorted(assigned):
+      log(f"  {controller_id}) {CONTROLLER_NAMES[controller_id]:10s} -> {assigned[controller_id]}")
+    return assigned
+  finally:
+    for ser in serials.values():
+      ser.close()
 
 
 def features(window) -> np.ndarray:
@@ -84,21 +219,21 @@ def load_dataset(gestures_dir: str, labels):
   for label in labels:
     files = sorted(glob.glob(os.path.join(gestures_dir, f"{label}_*.txt")))
     if not files:
-      print(f"[WARN] No files found for label '{label}' in {gestures_dir}/")
+      log(f"[WARN] No files found for label '{label}' in {gestures_dir}/")
       continue
     kept = 0
     for path in files:
       try:
         arr = np.loadtxt(path, delimiter=",")
       except Exception as e:
-        print(f"[WARN] Skipping {path}: {e}")
+        log(f"[WARN] Skipping {path}: {e}")
         continue
       if arr.ndim != 2 or arr.shape[1] != 6 or arr.shape[0] < 10:
         continue
       X.append(features(arr))
       y.append(label)
       kept += 1
-    print(f"[LOAD] {label:16s} {kept:3d} files")
+    log(f"[LOAD] {label:16s} {kept:3d} files")
   return np.array(X), np.array(y)
 
 
@@ -108,17 +243,24 @@ def train_model(X, y):
     ("svm",    SVC(kernel="rbf", C=10.0, gamma="scale")),
   ])
   model.fit(X, y)
-  print(f"[TRAIN] Training accuracy: {model.score(X, y):.3f}")
+  log(f"[TRAIN] Training accuracy: {model.score(X, y):.3f}")
   return model
 
 
-def read_sample(ser):
-  raw = ser.readline()
-  try:
-    line = raw.decode("utf-8", errors="replace").strip()
-  except Exception:
-    return None
-  return parse_line(line)
+def train_required_model(gestures_dir: str, labels, name: str):
+  log(f"[INFO] Loading {name} training data ...")
+  X, y = load_dataset(gestures_dir, labels)
+  if len(X) == 0:
+    log(f"[ERROR] No training samples loaded for {name}.")
+    sys.exit(1)
+  log(f"[INFO] Loaded {len(X)} {name} samples across {len(set(y))} classes")
+
+  log(f"[INFO] Training {name} SVM ...")
+  return train_model(X, y)
+
+
+def should_stop(stop_event) -> bool:
+  return stop_event is not None and stop_event.is_set()
 
 
 def wrap180(deg: float) -> float:
@@ -135,34 +277,36 @@ def steer_bar(angle_deg: float) -> str:
   return "[" + "".join(cells) + "]"
 
 
-def steering_loop(port: str, baud: int):
-  print(f"[INFO] Opening {port} @ {baud} baud …")
-  with serial.Serial(port, baud, timeout=1) as ser:
-    print(f"[INFO] Hold the remote level for {STEER_CALIB_SEC:.1f}s to calibrate …")
+def steering_loop(port: str, baud: int, stop_event=None, name: str = "steering"):
+  log(f"[{name}] Opening {port} @ {baud} baud ...")
+  with serial.Serial(port, baud, timeout=0.2) as ser:
+    log(f"[{name}] Hold the remote level for {STEER_CALIB_SEC:.1f}s to calibrate ...")
     calib = []
     t0 = time.perf_counter()
-    while time.perf_counter() - t0 < STEER_CALIB_SEC:
+    while time.perf_counter() - t0 < STEER_CALIB_SEC and not should_stop(stop_event):
       s = read_sample(ser)
       if s is not None:
         calib.append(s)
+    if should_stop(stop_event):
+      return
     if len(calib) < 10:
-      print("[ERROR] Not enough calibration samples; is the IMU streaming?", file=sys.stderr)
+      log(f"[{name}] ERROR: Not enough calibration samples; is the IMU streaming?")
       return
 
     arr = np.asarray(calib, dtype=np.float32)
     ax0, ay0, _ = arr[:, 0:3].mean(axis=0)
     gz_bias = float(arr[:, 5].mean())
     zero_angle = float(np.degrees(np.arctan2(ax0, ay0)))
-    print(f"[CALIB] zero={zero_angle:+.2f}°  gz_bias={gz_bias:+.3f}°/s  "
-          f"({len(calib)} samples)")
-    print("[INFO] Steering active — rotate the remote around its z-axis (Ctrl-C to stop)")
+    log(f"[{name}] Calibrated zero={zero_angle:+.2f} deg  gz_bias={gz_bias:+.3f} deg/s  "
+        f"({len(calib)} samples)")
+    log(f"[{name}] Steering active - rotate the remote around its z-axis (Ctrl-C to stop)")
 
     angle = 0.0
     last_t = time.perf_counter()
     last_print = 0.0
     print_period = 1.0 / STEER_PRINT_HZ
 
-    while True:
+    while not should_stop(stop_event):
       sample = read_sample(ser)
       if sample is None:
         continue
@@ -182,17 +326,18 @@ def steering_loop(port: str, baud: int):
 
       if now - last_print >= print_period:
         last_print = now
-        print(f"\r[STEER] {angle:+7.2f}°  rate={gyro_rate:+7.2f}°/s  {steer_bar(angle)}",
-              end="", flush=True)
+        log(f"\r[{name}] {angle:+7.2f} deg  rate={gyro_rate:+7.2f} deg/s  {steer_bar(angle)}",
+            end="")
 
 
-def realtime_loop(model, port: str, baud: int, activity_threshold: float):
-  print(f"[INFO] Opening {port} @ {baud} baud …")
-  with serial.Serial(port, baud, timeout=1) as ser:
-    print("[INFO] Listening for gestures (Ctrl-C to stop)")
+def realtime_loop(model, port: str, baud: int, activity_threshold: float,
+                  stop_event=None, name: str = "gesture"):
+  log(f"[{name}] Opening {port} @ {baud} baud ...")
+  with serial.Serial(port, baud, timeout=0.2) as ser:
+    log(f"[{name}] Listening for gestures (Ctrl-C to stop)")
     recent = deque(maxlen=ACTIVITY_WINDOW)
 
-    while True:
+    while not should_stop(stop_event):
       sample = read_sample(ser)
       if sample is None:
         continue
@@ -207,19 +352,72 @@ def realtime_loop(model, port: str, baud: int, activity_threshold: float):
         continue
 
       window = list(recent)
-      while len(window) < WINDOW_LEN:
+      while len(window) < WINDOW_LEN and not should_stop(stop_event):
         s = read_sample(ser)
         if s is not None:
           window.append(s)
+      if len(window) < WINDOW_LEN:
+        break
 
       feats = features(window[:WINDOW_LEN]).reshape(1, -1)
       pred = model.predict(feats)[0]
-      print(f"[GESTURE] {pred}   (activity={activity:.3f})")
+      log(f"[{name}] GESTURE {pred}   (activity={activity:.3f})")
 
       t0 = time.perf_counter()
-      while time.perf_counter() - t0 < COOLDOWN_SEC:
+      while time.perf_counter() - t0 < COOLDOWN_SEC and not should_stop(stop_event):
         read_sample(ser)
       recent.clear()
+
+
+def controller_worker(name: str, stop_event, target, *args):
+  try:
+    target(*args, stop_event=stop_event, name=name)
+  except serial.SerialException as e:
+    log(f"\n[{name}] ERROR: Serial connection failed: {e}")
+    stop_event.set()
+  except Exception as e:
+    log(f"\n[{name}] ERROR: {e}")
+    stop_event.set()
+
+
+def run_all_controllers(assignments, right_hand_model, foot_model, baud: int):
+  stop_event = threading.Event()
+  workers = [
+    threading.Thread(
+      target=controller_worker,
+      args=("left hand", stop_event, steering_loop, assignments[1], baud),
+      daemon=False,
+    ),
+    threading.Thread(
+      target=controller_worker,
+      args=("right hand", stop_event, realtime_loop,
+            right_hand_model, assignments[2], baud, ACTIVITY_THRESHOLD_HAND),
+      daemon=False,
+    ),
+    threading.Thread(
+      target=controller_worker,
+      args=("foot", stop_event, realtime_loop,
+            foot_model, assignments[3], baud, ACTIVITY_THRESHOLD_FOOT),
+      daemon=False,
+    ),
+  ]
+
+  log("[INFO] Starting all 3 controllers.")
+  for worker in workers:
+    worker.start()
+
+  try:
+    while any(worker.is_alive() for worker in workers):
+      time.sleep(0.2)
+      if stop_event.is_set():
+        break
+  except KeyboardInterrupt:
+    log("\n[INFO] Stopping all controllers ...")
+    stop_event.set()
+
+  for worker in workers:
+    worker.join(timeout=2.0)
+  log("\n[INFO] Bye.")
 
 
 def main():
@@ -229,44 +427,12 @@ def main():
                       help=f"Directory of recorded gesture .txt files (default: {GESTURES_DIR}/)")
   args = parser.parse_args()
 
-  print("[INFO] Select mode:")
-  print("  1) left hand (hold_item, item_forwards, item_backwards, look_backwards, drift_hop)")
-  print("  2) right hand (steering - continuous angle around z-axis)")
-  print("  3) foot (accelerate, brake)")
-  choice = ""
-  while choice not in ("1", "2", "3"):
-    choice = input("Press 1, 2, or 3: ").strip()
+  assignments = assign_controller_ports(args.baud)
 
-  if choice == "2":
-    port = find_port()
-    try:
-      steering_loop(port, args.baud)
-    except KeyboardInterrupt:
-      print("\n[INFO] Bye.")
-    return
+  right_hand_model = train_required_model(args.gestures_dir, LABELS_1, "right hand")
+  foot_model = train_required_model(args.gestures_dir, LABELS_2, "foot")
 
-  if choice == "1":
-    labels = LABELS_1
-    activity_threshold = ACTIVITY_THRESHOLD_HAND
-  else:
-    labels = LABELS_2
-    activity_threshold = ACTIVITY_THRESHOLD_FOOT
-
-  print("[INFO] Loading training data …")
-  X, y = load_dataset(args.gestures_dir, labels)
-  if len(X) == 0:
-    print("[ERROR] No training samples loaded.", file=sys.stderr)
-    sys.exit(1)
-  print(f"[INFO] Loaded {len(X)} samples across {len(set(y))} classes")
-
-  print("[INFO] Training SVM …")
-  model = train_model(X, y)
-
-  port = find_port()
-  try:
-    realtime_loop(model, port, args.baud, activity_threshold)
-  except KeyboardInterrupt:
-    print("\n[INFO] Bye.")
+  run_all_controllers(assignments, right_hand_model, foot_model, args.baud)
 
 
 if __name__ == "__main__":
