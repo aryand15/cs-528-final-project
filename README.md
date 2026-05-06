@@ -3,9 +3,12 @@
 This project aims to adapt raw sensor data into gamepad input. The proof of concept will be using four IMU sensors to play Mario Kart 8.
 
 ## Getting Started
-### Prerequisites
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
+### Prerequisites
+- `vgamepad` needs to be installed via pip:
+```sh
+pip install vgamepad
+```
 
 ## Contributors:
 - [Aryan](https://github.com/aryand15)
