@@ -230,14 +230,14 @@ def main():
   args = parser.parse_args()
 
   print("[INFO] Select mode:")
-  print("  1) hold_item, item_forwards, item_backwards, look_backwards, drift_hop")
-  print("  2) accelerate, brake")
-  print("  3) steering (continuous angle around z-axis)")
+  print("  1) left hand (hold_item, item_forwards, item_backwards, look_backwards, drift_hop)")
+  print("  2) right hand (steering - continuous angle around z-axis)")
+  print("  3) foot (accelerate, brake)")
   choice = ""
   while choice not in ("1", "2", "3"):
     choice = input("Press 1, 2, or 3: ").strip()
 
-  if choice == "3":
+  if choice == "2":
     port = find_port()
     try:
       steering_loop(port, args.baud)
