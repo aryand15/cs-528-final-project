@@ -39,6 +39,7 @@ ACTIVITY_THRESHOLD_FOOT = 0.05
 DRIFT_HOP_ACTIVITY_THRESHOLD = 0.18
 ACTIVITY_WINDOW         = 20
 COOLDOWN_SEC            = 1.0
+BUTTON_TAP_SEC          = 0.08
 
 CONTROLLER_NAMES = {
   1: "left hand",
@@ -278,7 +279,132 @@ def steer_bar(angle_deg: float) -> str:
   return "[" + "".join(cells) + "]"
 
 
-def steering_loop(port: str, baud: int, stop_event=None, name: str = "steering"):
+class NullOutput:
+  def set_steering(self, angle_deg: float):
+    pass
+
+  def handle_gesture(self, gesture: str):
+    pass
+
+  def release_all(self):
+    pass
+
+
+class XboxGamepadOutput:
+  def __init__(self, invert_steering: bool = False):
+    try:
+      import vgamepad as vg
+    except ImportError:
+      log("[ERROR] Xbox output needs the 'vgamepad' package and ViGEmBus installed.")
+      log("[ERROR] Re-run with --output none to test recognition without controller output.")
+      sys.exit(1)
+
+    self.vg = vg
+    self.gamepad = vg.VX360Gamepad()
+    self.lock = threading.Lock()
+    self.invert_steering = invert_steering
+    self.steer_x = 0.0
+    self.right_trigger = 0.0
+    self.left_trigger = 0.0
+    self.item_held = False
+    self.release_all()
+    log("[INFO] Xbox controller output enabled.")
+
+  def _update_locked(self):
+    self.gamepad.left_joystick_float(x_value_float=self.steer_x, y_value_float=0.0)
+    self.gamepad.right_trigger_float(value_float=self.right_trigger)
+    self.gamepad.left_trigger_float(value_float=self.left_trigger)
+    self.gamepad.update()
+
+  def _log_input(self, message: str):
+    log(f"[XBOX] {message}")
+
+  def set_steering(self, angle_deg: float):
+    x = max(-1.0, min(1.0, angle_deg / STEER_BAR_MAX_DEG))
+    if self.invert_steering:
+      x = -x
+    with self.lock:
+      self.steer_x = x
+      self._update_locked()
+
+  def _tap_button_locked(self, button, button_name: str):
+    self._log_input(f"tap {button_name}")
+    self.gamepad.press_button(button=button)
+    self.gamepad.update()
+    time.sleep(BUTTON_TAP_SEC)
+    self.gamepad.release_button(button=button)
+    self._update_locked()
+
+  def _release_item_locked(self):
+    if self.item_held:
+      self._log_input("release LB")
+      self.gamepad.release_button(button=self.vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
+      self.item_held = False
+
+  def handle_gesture(self, gesture: str):
+    b = self.vg.XUSB_BUTTON
+    with self.lock:
+      if gesture == "hold_item":
+        self._log_input("hold LB")
+        self.gamepad.press_button(button=b.XUSB_GAMEPAD_LEFT_SHOULDER)
+        self.item_held = True
+        self._update_locked()
+      elif gesture == "item_forwards":
+        if self.item_held:
+          self._release_item_locked()
+          self._update_locked()
+        else:
+          self._tap_button_locked(b.XUSB_GAMEPAD_LEFT_SHOULDER, "LB")
+      elif gesture == "item_backwards":
+        self._log_input("hold D-pad down")
+        self.gamepad.press_button(button=b.XUSB_GAMEPAD_DPAD_DOWN)
+        if self.item_held:
+          self._release_item_locked()
+          self._update_locked()
+          time.sleep(BUTTON_TAP_SEC)
+        else:
+          self._tap_button_locked(b.XUSB_GAMEPAD_LEFT_SHOULDER, "LB")
+        self._log_input("release D-pad down")
+        self.gamepad.release_button(button=b.XUSB_GAMEPAD_DPAD_DOWN)
+        self._update_locked()
+      elif gesture == "look_backwards":
+        self._tap_button_locked(b.XUSB_GAMEPAD_Y, "Y")
+      elif gesture == "drift_hop":
+        self._tap_button_locked(b.XUSB_GAMEPAD_RIGHT_SHOULDER, "RB")
+      elif gesture == "accelerate":
+        self._log_input("hold RT, release LT")
+        self.right_trigger = 1.0
+        self.left_trigger = 0.0
+        self._update_locked()
+      elif gesture == "brake":
+        self._log_input("hold LT, release RT")
+        self.right_trigger = 0.0
+        self.left_trigger = 1.0
+        self._update_locked()
+
+  def release_all(self):
+    with self.lock:
+      self.steer_x = 0.0
+      self.right_trigger = 0.0
+      self.left_trigger = 0.0
+      self.item_held = False
+      try:
+        self.gamepad.reset()
+      except AttributeError:
+        pass
+      self._update_locked()
+
+
+def make_output(output_mode: str, invert_steering: bool):
+  if output_mode == "none":
+    log("[INFO] Controller output disabled.")
+    return NullOutput()
+  if output_mode == "xbox":
+    return XboxGamepadOutput(invert_steering=invert_steering)
+  raise ValueError(f"Unsupported output mode: {output_mode}")
+
+
+def steering_loop(port: str, baud: int, output=None, stop_event=None, name: str = "steering"):
   log(f"[{name}] Opening {port} @ {baud} baud ...")
   with serial.Serial(port, baud, timeout=0.2) as ser:
     log(f"[{name}] Hold the remote level for {STEER_CALIB_SEC:.1f}s to calibrate ...")
@@ -327,12 +453,15 @@ def steering_loop(port: str, baud: int, stop_event=None, name: str = "steering")
 
       if now - last_print >= print_period:
         last_print = now
+        if output is not None:
+          output.set_steering(angle)
         log(f"\r[{name}] {angle:+7.2f} deg  rate={gyro_rate:+7.2f} deg/s  {steer_bar(angle)}",
             end="")
 
 
 def realtime_loop(model, port: str, baud: int, activity_threshold: float,
-                  label_activity_thresholds=None, stop_event=None, name: str = "gesture"):
+                  label_activity_thresholds=None, output=None, stop_event=None,
+                  name: str = "gesture"):
   log(f"[{name}] Opening {port} @ {baud} baud ...")
   with serial.Serial(port, baud, timeout=0.2) as ser:
     log(f"[{name}] Listening for gestures (Ctrl-C to stop)")
@@ -366,6 +495,8 @@ def realtime_loop(model, port: str, baud: int, activity_threshold: float,
       if label_threshold is not None and activity < label_threshold:
         recent.clear()
         continue
+      if output is not None:
+        output.handle_gesture(pred)
       log(f"[{name}] GESTURE {pred}   (activity={activity:.3f})")
 
       t0 = time.perf_counter()
@@ -385,25 +516,25 @@ def controller_worker(name: str, stop_event, target, *args):
     stop_event.set()
 
 
-def run_all_controllers(assignments, right_hand_model, foot_model, baud: int):
+def run_all_controllers(assignments, right_hand_model, foot_model, baud: int, output):
   stop_event = threading.Event()
   workers = [
     threading.Thread(
       target=controller_worker,
-      args=("left hand", stop_event, steering_loop, assignments[1], baud),
+      args=("left hand", stop_event, steering_loop, assignments[1], baud, output),
       daemon=False,
     ),
     threading.Thread(
       target=controller_worker,
       args=("right hand", stop_event, realtime_loop,
             right_hand_model, assignments[2], baud, ACTIVITY_THRESHOLD_HAND,
-            {"drift_hop": DRIFT_HOP_ACTIVITY_THRESHOLD}),
+            {"drift_hop": DRIFT_HOP_ACTIVITY_THRESHOLD}, output),
       daemon=False,
     ),
     threading.Thread(
       target=controller_worker,
       args=("foot", stop_event, realtime_loop,
-            foot_model, assignments[3], baud, ACTIVITY_THRESHOLD_FOOT),
+            foot_model, assignments[3], baud, ACTIVITY_THRESHOLD_FOOT, None, output),
       daemon=False,
     ),
   ]
@@ -423,6 +554,7 @@ def run_all_controllers(assignments, right_hand_model, foot_model, baud: int):
 
   for worker in workers:
     worker.join(timeout=2.0)
+  output.release_all()
   log("\n[INFO] Bye.")
 
 
@@ -431,14 +563,19 @@ def main():
   parser.add_argument("--baud", default=BAUD_RATE, type=int)
   parser.add_argument("--gestures-dir", default=GESTURES_DIR,
                       help=f"Directory of recorded gesture .txt files (default: {GESTURES_DIR}/)")
+  parser.add_argument("--output", choices=("xbox", "none"), default="xbox",
+                      help="Send recognized controls to a virtual Xbox controller, or disable output.")
+  parser.add_argument("--invert-steering", action="store_true",
+                      help="Flip the left-hand steering direction.")
   args = parser.parse_args()
 
+  output = make_output(args.output, args.invert_steering)
   assignments = assign_controller_ports(args.baud)
 
   right_hand_model = train_required_model(args.gestures_dir, LABELS_1, "right hand")
   foot_model = train_required_model(args.gestures_dir, LABELS_2, "foot")
 
-  run_all_controllers(assignments, right_hand_model, foot_model, args.baud)
+  run_all_controllers(assignments, right_hand_model, foot_model, args.baud, output)
 
 
 if __name__ == "__main__":
