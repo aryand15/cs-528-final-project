@@ -52,7 +52,7 @@ DETECT_MIN_ACTIVITY = 0.03
 
 STEER_CALIB_SEC   = 2.0
 STEER_ALPHA       = 0.98
-STEER_PRINT_HZ    = 20.0
+STEER_PRINT_HZ    = 60.0
 STEER_BAR_WIDTH   = 41
 STEER_BAR_MAX_DEG = 90.0
 
@@ -327,13 +327,17 @@ class XboxGamepadOutput:
       self.steer_x = x
       self._update_locked()
 
-  def _tap_button_locked(self, button, button_name: str):
-    self._log_input(f"tap {button_name}")
-    self.gamepad.press_button(button=button)
-    self.gamepad.update()
-    time.sleep(BUTTON_TAP_SEC)
-    self.gamepad.release_button(button=button)
-    self._update_locked()
+  def tap_button(self, button, button_name: str):
+    def tap_task():
+      with self.lock:
+        self._log_input(f"tap {button_name}")
+        self.gamepad.press_button(button=button)
+        self._update_locked()
+      time.sleep(BUTTON_TAP_SEC)
+      with self.lock:
+        self.gamepad.release_button(button=button)
+        self._update_locked()
+    threading.Thread(target=tap_task, daemon=True).start()
 
   def _release_item_locked(self):
     if self.item_held:
@@ -343,43 +347,55 @@ class XboxGamepadOutput:
 
   def handle_gesture(self, gesture: str):
     b = self.vg.XUSB_BUTTON
-    with self.lock:
-      if gesture == "hold_item":
+    if gesture == "hold_item":
+      with self.lock:
         self._log_input("hold LB")
         self.gamepad.press_button(button=b.XUSB_GAMEPAD_LEFT_SHOULDER)
         self.item_held = True
         self._update_locked()
-      elif gesture == "item_forwards":
-        if self.item_held:
+    elif gesture == "item_forwards":
+      with self.lock:
+        was_held = self.item_held
+        if was_held:
           self._release_item_locked()
           self._update_locked()
-        else:
-          self._tap_button_locked(b.XUSB_GAMEPAD_LEFT_SHOULDER, "LB")
-      elif gesture == "item_backwards":
-        self._log_input("hold D-pad down")
-        self.gamepad.press_button(button=b.XUSB_GAMEPAD_DPAD_DOWN)
-        if self.item_held:
-          self._release_item_locked()
+      if not was_held:
+        self.tap_button(b.XUSB_GAMEPAD_LEFT_SHOULDER, "LB")
+    elif gesture == "item_backwards":
+      def backwards_task():
+        with self.lock:
+          self._log_input("hold D-pad down")
+          self.gamepad.press_button(button=b.XUSB_GAMEPAD_DPAD_DOWN)
+          was_held = self.item_held
+          if was_held:
+            self._release_item_locked()
+          else:
+            self._log_input("tap LB")
+            self.gamepad.press_button(button=b.XUSB_GAMEPAD_LEFT_SHOULDER)
           self._update_locked()
-          time.sleep(BUTTON_TAP_SEC)
-        else:
-          self._tap_button_locked(b.XUSB_GAMEPAD_LEFT_SHOULDER, "LB")
-        self._log_input("release D-pad down")
-        self.gamepad.release_button(button=b.XUSB_GAMEPAD_DPAD_DOWN)
+        time.sleep(BUTTON_TAP_SEC)
+        with self.lock:
+          if not was_held:
+            self.gamepad.release_button(button=b.XUSB_GAMEPAD_LEFT_SHOULDER)
+          self._log_input("release D-pad down")
+          self.gamepad.release_button(button=b.XUSB_GAMEPAD_DPAD_DOWN)
+          self._update_locked()
+      threading.Thread(target=backwards_task, daemon=True).start()
+    elif gesture == "look_backwards":
+      self.tap_button(b.XUSB_GAMEPAD_Y, "Y")
+    elif gesture == "drift_hop":
+      self.tap_button(b.XUSB_GAMEPAD_RIGHT_SHOULDER, "RB")
+    elif gesture == "accelerate":
+      with self.lock:
+        self._log_input("hold B, release A")
+        self.gamepad.press_button(button=b.XUSB_GAMEPAD_B)
+        self.gamepad.release_button(button=b.XUSB_GAMEPAD_A)
         self._update_locked()
-      elif gesture == "look_backwards":
-        self._tap_button_locked(b.XUSB_GAMEPAD_Y, "Y")
-      elif gesture == "drift_hop":
-        self._tap_button_locked(b.XUSB_GAMEPAD_RIGHT_SHOULDER, "RB")
-      elif gesture == "accelerate":
-        self._log_input("hold RT, release LT")
-        self.right_trigger = 1.0
-        self.left_trigger = 0.0
-        self._update_locked()
-      elif gesture == "brake":
-        self._log_input("hold LT, release RT")
-        self.right_trigger = 0.0
-        self.left_trigger = 1.0
+    elif gesture == "brake":
+      with self.lock:
+        self._log_input("hold A, release B")
+        self.gamepad.press_button(button=b.XUSB_GAMEPAD_A)
+        self.gamepad.release_button(button=b.XUSB_GAMEPAD_B)
         self._update_locked()
 
   def release_all(self):
@@ -389,6 +405,8 @@ class XboxGamepadOutput:
       self.left_trigger = 0.0
       self.item_held = False
       try:
+        self.gamepad.release_button(button=self.vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
+        self.gamepad.release_button(button=self.vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
         self.gamepad.reset()
       except AttributeError:
         pass
@@ -434,6 +452,11 @@ def steering_loop(port: str, baud: int, output=None, stop_event=None, name: str 
     print_period = 1.0 / STEER_PRINT_HZ
 
     while not should_stop(stop_event):
+      # Drain the input buffer completely to ensure we only process the freshest sample
+      while ser.in_waiting > 100:
+        ser.reset_input_buffer()
+        ser.readline() # Discard the partial line
+      
       sample = read_sample(ser)
       if sample is None:
         continue
@@ -468,6 +491,10 @@ def realtime_loop(model, port: str, baud: int, activity_threshold: float,
     recent = deque(maxlen=ACTIVITY_WINDOW)
 
     while not should_stop(stop_event):
+      if ser.in_waiting > 200:
+        ser.reset_input_buffer()
+        ser.readline() # Discard the partial line
+      
       sample = read_sample(ser)
       if sample is None:
         continue
